@@ -184,15 +184,77 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const cha
 void usage(const char *prog) {
     fprintf(stderr, "Usage: %s --set <username>\n", prog);
     fprintf(stderr, "       %s --delete <username>\n", prog);
+    fprintf(stderr, "       %s --status\n", prog);
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
+    if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
     const char *action = argv[1];
+
+    if (strcmp(action, "--status") == 0 || strcmp(action, "-s") == 0) {
+        printf("\n\033[1mPAM & LUKS Alternative Passwords Status\033[0m\n");
+        printf("----------------------------------------\n");
+        
+        // 1. Vault status
+        FILE *f = fopen(VAULT_PATH, "rb");
+        if (f) {
+            printf("\033[92m✔\033[0m Keyring Compatibility Vault: PRESENT\n");
+            struct vault_record rec;
+            printf("  Configured users:\n");
+            while (fread(&rec, sizeof(rec), 1, f) == 1) {
+                printf("    - %s\n", rec.username);
+            }
+            fclose(f);
+        } else {
+            printf("\033[93m⚠\033[0m Keyring Compatibility Vault: NOT PRESENT / EMPTY\n");
+        }
+        
+        // 2. Queue status
+        if (access(TEMP_KEYS_PATH, F_OK) == 0) {
+            printf("\033[93m⚠\033[0m LUKS Password Queue: PENDING (credentials cached in memory, waiting for encryption)\n");
+        } else {
+            printf("\033[92m✔\033[0m LUKS Password Queue: COMPLETED (no cached credentials in memory)\n");
+        }
+        
+        // 3. LUKS device status
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd), "cryptsetup isLuks %s 2>/dev/null", LUKS_DEV);
+        int is_luks = system(cmd);
+        if (is_luks == 0) {
+            printf("\033[92m✔\033[0m LUKS Partition: PRESENT (%s)\n", LUKS_DEV);
+            
+            // Count active keyslots
+            snprintf(cmd, sizeof(cmd), "cryptsetup luksDump %s 2>/dev/null", LUKS_DEV);
+            FILE *dp = popen(cmd, "r");
+            if (dp) {
+                char line[256];
+                int slots = 0;
+                while (fgets(line, sizeof(line), dp)) {
+                    if (strstr(line, "luks2") && strstr(line, ":")) {
+                        if (!strstr(line, "reencrypt")) {
+                            slots++;
+                        }
+                    }
+                }
+                pclose(dp);
+                printf("  Active password/key slots: %d\n", slots);
+            }
+        } else {
+            printf("\033[91m✘\033[0m LUKS Partition: NOT FOUND or NOT LUKS format (%s)\n", LUKS_DEV);
+        }
+        printf("\n");
+        return 0;
+    }
+
+    if (argc < 3) {
+        usage(argv[0]);
+        return 1;
+    }
+
     const char *username = argv[2];
 
     if (strcmp(action, "--set") != 0 && strcmp(action, "--delete") != 0) {
