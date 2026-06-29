@@ -1,0 +1,12 @@
+# Binaries
+pam_keyring_compat.so
+pam_keyring_compat_tool
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Backup files
+*.bak
+*.tmp
+*.log
