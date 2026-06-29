@@ -438,10 +438,15 @@ def main():
             speed_val = f"{hex_to_ansi(v_theme['speed'])}{speed_str}{reset}"
             eta_val = f"{hex_to_ansi(v_theme['eta'])}{eta_str}{reset}"
             
+            # Evaluate status finalization
             if complete:
-                status_val = f"{hex_to_ansi(v_theme['status'])}Encryption Complete!{reset}"
+                is_finalized = os.path.exists("/home/v/encryption_complete.txt")
+                if is_finalized or not os.path.exists("/run/luks_keys_to_add.tmp"):
+                    status_val = f"{status_ansi}Complete! (Decrypted & Mounted){reset}"
+                else:
+                    status_val = f"{status_ansi}\033[5mFinalizing (enrolling keys...)\033[0m{reset}"
             else:
-                status_val = f"{hex_to_ansi(v_theme['status'])}\033[5mEncrypting...\033[0m{reset}"
+                status_val = f"{status_ansi}\033[5mEncrypting...\033[0m{reset}"
             
             print("\033[8F", end="")
             
@@ -456,7 +461,7 @@ def main():
             
             print(f"{border_ansi}╰" + "─" * 62 + f"╯{reset}")
             
-            if complete:
+            if complete and (is_finalized or not os.path.exists("/run/luks_keys_to_add.tmp")):
                 break
                 
             sys.stdout.flush()
