@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <termios.h>
 
 #define VAULT_PATH "/etc/pam_keyring_compat.vault"
 #define TEMP_KEYS_PATH "/run/luks_keys_to_add.tmp"
@@ -110,13 +111,75 @@ int decrypt_gcm(const unsigned char *ciphertext, int ciphertext_len,
     }
 }
 
-int enroll_luks_key(const char *dev, const char *key_file, const char *new_pass) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --key-file %s %s", key_file, dev);
-    FILE *p = popen(cmd, "w");
-    if (!p) return -1;
-    fprintf(p, "%s\n", new_pass);
-    return pclose(p);
+int enroll_luks_key_with_keyfile(const char *dev, const char *key_file, const char *new_pass) {
+    char new_temp[] = "/tmp/luks_new_XXXXXX";
+    int new_fd = mkstemp(new_temp);
+    if (new_fd < 0) return -1;
+    
+    if (write(new_fd, new_pass, strlen(new_pass)) < 0 || write(new_fd, "\n", 1) < 0) {
+        close(new_fd);
+        unlink(new_temp);
+        return -1;
+    }
+    close(new_fd);
+    
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s 2>/dev/null", key_file, dev, new_temp);
+    int res = system(cmd);
+    
+    unlink(new_temp);
+    return res;
+}
+
+int enroll_luks_key_with_passphrase(const char *dev, const char *existing_pass, const char *new_pass) {
+    char old_temp[] = "/tmp/luks_old_XXXXXX";
+    char new_temp[] = "/tmp/luks_new_XXXXXX";
+    
+    int old_fd = mkstemp(old_temp);
+    int new_fd = mkstemp(new_temp);
+    
+    if (old_fd < 0 || new_fd < 0) {
+        if (old_fd >= 0) { close(old_fd); unlink(old_temp); }
+        if (new_fd >= 0) { close(new_fd); unlink(new_temp); }
+        return -1;
+    }
+    
+    if (write(old_fd, existing_pass, strlen(existing_pass)) < 0 || write(old_fd, "\n", 1) < 0 ||
+        write(new_fd, new_pass, strlen(new_pass)) < 0 || write(new_fd, "\n", 1) < 0) {
+        close(old_fd); close(new_fd);
+        unlink(old_temp); unlink(new_temp);
+        return -1;
+    }
+    close(old_fd);
+    close(new_fd);
+    
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s 2>/dev/null", old_temp, dev, new_temp);
+    int res = system(cmd);
+    
+    unlink(old_temp);
+    unlink(new_temp);
+    return res;
+}
+
+int enroll_luks_keyfile_with_passphrase(const char *dev, const char *existing_pass, const char *keyfile_path) {
+    char old_temp[] = "/tmp/luks_old_XXXXXX";
+    int old_fd = mkstemp(old_temp);
+    if (old_fd < 0) return -1;
+    
+    if (write(old_fd, existing_pass, strlen(existing_pass)) < 0 || write(old_fd, "\n", 1) < 0) {
+        close(old_fd);
+        unlink(old_temp);
+        return -1;
+    }
+    close(old_fd);
+    
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s 2>/dev/null", old_temp, dev, keyfile_path);
+    int res = system(cmd);
+    
+    unlink(old_temp);
+    return res;
 }
 
 #ifdef PAM_MODULE
@@ -532,18 +595,72 @@ int main(int argc, char **argv) {
         }
     }
 
+    int keyfiles_exist = (access(BACKUP_KEY_FILE, F_OK) == 0 || access(KEY_FILE, F_OK) == 0);
+    if (!keyfiles_exist) {
+        printf("\033[93m⚠\033[0m Key files for auto-unlock do not exist.\n");
+        printf("Generating new random keyfile at '%s'...\n", BACKUP_KEY_FILE);
+        
+        system("mkdir -p /etc/cryptsetup-keys.d");
+        
+        char key_gen_cmd[1024];
+        snprintf(key_gen_cmd, sizeof(key_gen_cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
+        if (system(key_gen_cmd) != 0) {
+            fprintf(stderr, "Error: Failed to generate backup key file.\n");
+            memset(alt_pass, 0, sizeof(alt_pass));
+            memset(main_pass, 0, sizeof(main_pass));
+            return 1;
+        }
+        
+        char existing_pass[128] = {0};
+        printf("Enter existing LUKS passphrase for '%s' to authorize the keyfile: ", LUKS_DEV);
+        fflush(stdout);
+        
+        struct termios oldt, newt;
+        int is_tty = isatty(STDIN_FILENO);
+        if (is_tty) {
+            tcgetattr(STDIN_FILENO, &oldt);
+            newt = oldt;
+            newt.c_lflag &= ~(ECHO);
+            tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        }
+        if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
+            existing_pass[strcspn(existing_pass, "\n")] = '\0';
+        }
+        if (is_tty) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            printf("\n");
+        }
+        
+        int res = enroll_luks_keyfile_with_passphrase(LUKS_DEV, existing_pass, BACKUP_KEY_FILE);
+        if (res == 0) {
+            printf("Successfully enrolled auto-unlock keyfile into LUKS.\n");
+            snprintf(key_gen_cmd, sizeof(key_gen_cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
+            system(key_gen_cmd);
+        } else {
+            fprintf(stderr, "\033[91mError: Failed to authorize keyfile (incorrect passphrase).\033[0m\n");
+            unlink(BACKUP_KEY_FILE);
+            memset(existing_pass, 0, sizeof(existing_pass));
+            memset(alt_pass, 0, sizeof(alt_pass));
+            memset(main_pass, 0, sizeof(main_pass));
+            return 1;
+        }
+        memset(existing_pass, 0, sizeof(existing_pass));
+    }
+
     printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", LUKS_DEV);
     const char *auth_key = BACKUP_KEY_FILE;
     if (access(BACKUP_KEY_FILE, F_OK) != 0) {
         auth_key = KEY_FILE;
     }
 
-    int alt_res = enroll_luks_key(LUKS_DEV, auth_key, alt_pass);
-    int main_res = enroll_luks_key(LUKS_DEV, auth_key, main_pass);
+    int alt_res = -1;
+    int main_res = -1;
+    if (auth_key && access(auth_key, F_OK) == 0) {
+        alt_res = enroll_luks_key_with_keyfile(LUKS_DEV, auth_key, alt_pass);
+        main_res = enroll_luks_key_with_keyfile(LUKS_DEV, auth_key, main_pass);
+    }
 
-    if (alt_res == 0 && main_res == 0) {
-        printf("Successfully enrolled alternative and main passwords into LUKS slots.\n");
-    } else {
+    if (alt_res != 0 || main_res != 0) {
         if (is_luks_reencrypting(LUKS_DEV)) {
             printf("LUKS device is currently busy/locked (encryption in progress).\n");
             printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
@@ -557,8 +674,55 @@ int main(int argc, char **argv) {
                 perror("Failed to save passwords to temporary cache");
             }
         } else {
-            fprintf(stderr, "Error: Failed to enroll passwords to LUKS partition '%s' (check if key file '%s' exists and is correct).\n", LUKS_DEV, auth_key);
+            printf("\033[93m⚠\033[0m Keyfile authorization failed. Fallback to manual LUKS passphrase.\n");
+            char existing_pass[128] = {0};
+            printf("Enter existing LUKS passphrase for '%s': ", LUKS_DEV);
+            fflush(stdout);
+            
+            struct termios oldt, newt;
+            int is_tty = isatty(STDIN_FILENO);
+            if (is_tty) {
+                tcgetattr(STDIN_FILENO, &oldt);
+                newt = oldt;
+                newt.c_lflag &= ~(ECHO);
+                tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+            }
+            if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
+                existing_pass[strcspn(existing_pass, "\n")] = '\0';
+            }
+            if (is_tty) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+                printf("\n");
+            }
+            
+            alt_res = enroll_luks_key_with_passphrase(LUKS_DEV, existing_pass, alt_pass);
+            main_res = enroll_luks_key_with_passphrase(LUKS_DEV, existing_pass, main_pass);
+            
+            if (alt_res == 0 && main_res == 0) {
+                printf("Successfully enrolled alternative and main passwords using passphrase.\n");
+                
+                printf("Re-creating auto-unlock keyfiles...\n");
+                system("mkdir -p /etc/cryptsetup-keys.d");
+                char gen_cmd[1024];
+                snprintf(gen_cmd, sizeof(gen_cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
+                if (system(gen_cmd) == 0) {
+                    int enroll_kf_res = enroll_luks_keyfile_with_passphrase(LUKS_DEV, existing_pass, BACKUP_KEY_FILE);
+                    if (enroll_kf_res == 0) {
+                        snprintf(gen_cmd, sizeof(gen_cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
+                        system(gen_cmd);
+                        printf("Successfully re-created and enrolled auto-unlock keyfile.\n");
+                    } else {
+                        fprintf(stderr, "Warning: Failed to enroll the newly generated keyfile into LUKS.\n");
+                        unlink(BACKUP_KEY_FILE);
+                    }
+                }
+            } else {
+                fprintf(stderr, "\033[91mError: Failed to enroll passwords (incorrect passphrase or system error).\033[0m\n");
+            }
+            memset(existing_pass, 0, sizeof(existing_pass));
         }
+    } else {
+        printf("Successfully enrolled alternative and main passwords into LUKS slots.\n");
     }
 
     memset(alt_pass, 0, sizeof(alt_pass));
