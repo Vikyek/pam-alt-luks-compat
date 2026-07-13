@@ -124,7 +124,7 @@ int enroll_luks_key_with_keyfile(const char *dev, const char *key_file, const ch
     close(new_fd);
     
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s 2>/dev/null", key_file, dev, new_temp);
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s", key_file, dev, new_temp);
     int res = system(cmd);
     
     unlink(new_temp);
@@ -154,7 +154,7 @@ int enroll_luks_key_with_passphrase(const char *dev, const char *existing_pass, 
     close(new_fd);
     
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s 2>/dev/null", old_temp, dev, new_temp);
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s", old_temp, dev, new_temp);
     int res = system(cmd);
     
     unlink(old_temp);
@@ -175,7 +175,7 @@ int enroll_luks_keyfile_with_passphrase(const char *dev, const char *existing_pa
     close(old_fd);
     
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s 2>/dev/null", old_temp, dev, keyfile_path);
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksAddKey --batch-mode --key-file %s %s %s", old_temp, dev, keyfile_path);
     int res = system(cmd);
     
     unlink(old_temp);
