@@ -10,8 +10,11 @@ This project provides a robust, permanent solution for integrating alternative p
     Allows GNOME Keyring to unlock automatically when logging in with an alternative password. Stores the main password encrypted via AES-256-GCM in `/etc/pam_keyring_compat.vault` (keys derived using PBKDF2), decrypting it at login to populate the PAM authentication token.
 2.  **Persistent Systemd Watcher:**
     Monitors core PAM files (`system-auth`, `su`, `su-l`, `vlock`, and quickshell `passwd`) for modifications or package overrides (such as `pambase` updates or manual `.pacnew` merges). Re-applies configuration patches automatically.
-3.  **Unified Password Tool (`pam_keyring_compat_tool`):**
-    Enrolls your main and alternative passwords into the Keyring Vault, and handles automatic/queued registration of passwords into the LUKS slots on your partition.
+3.  **Dynamic Partition & Passphrase Tool (`pam_keyring_compat_tool`):**
+    Enrolls your passwords into the Keyring Vault, dynamically scans all system partitions, and automatically enrolls them into LUKS slots.
+    *   **Self-Healing Keyfile Restoration:** If auto-unlock keyfiles (`data.key`/`data.key.backup`) are missing/deleted, it automatically regenerates them and prompts for your existing LUKS passphrase to authorize enrollment.
+    *   **Passphrase Fallback:** Falls back to direct passphrase authorization if keyfiles fail validation.
+    *   **Offline Root Encryption Script:** If an unencrypted root partition is found, it offers to generate a custom, ready-to-run chrooted script (`~/encrypt-root-offline.sh`) to perform offline in-place Btrfs/Ext4 root partition encryption from a Live USB.
 4.  **CLI Progress Monitor (`crypt-progress`):**
     A themed, rounded-corner terminal progress card monitor designed to mirror the color layouts and ASCII logo of your desktop's Caelestia fetch configuration. Includes an interactive arrow-key theme selector (`-t`/`--theme-menu`).
 
@@ -62,12 +65,13 @@ make clean
 ## Post-Install Usage
 
 ### 1. Unified Password Registration (Keyring + LUKS)
-To configure the secure keyring compatibility vault and register/queue your passwords for the LUKS partition (`/dev/sdc1`), run:
+To configure the secure keyring compatibility vault and enroll your passwords for all candidate partitions, run:
 
 ```bash
 sudo pam_keyring_compat_tool --set v
 ```
-*   *Note:* If the partition is not yet encrypted, the tool will offer to automatically shrink your filesystem (supporting online shrinking for Btrfs and offline for Ext2/3/4) by 32MB, generate cryptographic keys, initialize LUKS2, and launch background in-place encryption. If the partition is already encrypting, passwords are queued securely at `/run/luks_keys_to_add.tmp` and enrolled once done.
+*   *Note on Dynamic Partition Scanning:* The tool automatically detects all partitions on the system, excluding boot/EFI and the active root partition. It will enroll keys into any LUKS-encrypted partitions, and offer online in-place encryption for other unencrypted partitions.
+*   *Note on Offline Root Encryption:* Since an active root partition cannot be encrypted online, if the root partition is unencrypted, the tool will offer to generate a custom, automated offline root encryption script (`~/encrypt-root-offline.sh`). You can run this script after booting from a Live USB to securely perform in-place encryption on your root partition.
 
 ### 2. Monitoring Encryption progress
 You can watch the in-place encryption using the themed visual monitor card:
