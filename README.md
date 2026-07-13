@@ -12,9 +12,11 @@ This project provides a robust, permanent solution for integrating alternative p
     Monitors core PAM files (`system-auth`, `su`, `su-l`, `vlock`, and quickshell `passwd`) for modifications or package overrides (such as `pambase` updates or manual `.pacnew` merges). Re-applies configuration patches automatically.
 3.  **Dynamic Partition & Passphrase Tool (`pam_keyring_compat_tool`):**
     Enrolls your passwords into the Keyring Vault, dynamically scans all system partitions, and automatically enrolls them into LUKS slots.
+    *   **Masked Password Entry:** Hides all typed passphrases (alt pass, main pass, LUKS pass) using standard `*` characters.
+    *   **Partition Label Mentions:** Reads and mentions partition `PARTLABEL` or `LABEL` in prompt outputs.
     *   **Self-Healing Keyfile Restoration:** If auto-unlock keyfiles (`data.key`/`data.key.backup`) are missing/deleted, it automatically regenerates them and prompts for your existing LUKS passphrase to authorize enrollment.
     *   **Passphrase Fallback:** Falls back to direct passphrase authorization if keyfiles fail validation.
-    *   **Offline Root Encryption Script:** If an unencrypted root partition is found, it offers to generate a custom, ready-to-run chrooted script (`~/encrypt-root-offline.sh`) to perform offline in-place Btrfs/Ext4 root partition encryption from a Live USB.
+    *   **Offline Root Encryption Script & Auto-Check:** If an unencrypted root partition is found, it offers to generate a custom, ready-to-run chrooted script (`~/encrypt-root-offline.sh`) to perform offline in-place Btrfs/Ext4 root partition encryption from a Live USB. It also enables a temporary systemd service (`check-root-encryption.service`) that automatically monitors the next boot: if root encryption succeeded, it deletes the offline script, triggers a critical desktop notification reporting success, and disables itself.
 4.  **CLI Progress Monitor (`crypt-progress`):**
     A themed, rounded-corner terminal progress card monitor designed to mirror the color layouts and ASCII logo of your desktop's Caelestia fetch configuration. Includes an interactive arrow-key theme selector (`-t`/`--theme-menu`).
 
