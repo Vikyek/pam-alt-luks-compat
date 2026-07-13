@@ -8,6 +8,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <termios.h>
+#include <pwd.h>
 
 #define VAULT_PATH "/etc/pam_keyring_compat.vault"
 #define TEMP_KEYS_PATH "/run/luks_keys_to_add.tmp"
@@ -505,6 +506,112 @@ int attempt_inplace_encryption(const char *dev, const char *fstype, const char *
     return 0;
 }
 
+int generate_offline_root_encryption_script(const char *username, const char *root_dev_path, const char *boot_dev_path, const char *fstype) {
+    struct passwd *pw = getpwnam(username);
+    if (!pw) {
+        fprintf(stderr, "Error: Failed to locate home directory for user '%s'.\n", username);
+        return -1;
+    }
+    
+    char script_path[512];
+    snprintf(script_path, sizeof(script_path), "%s/encrypt-root-offline.sh", pw->pw_dir);
+    
+    FILE *sf = fopen(script_path, "w");
+    if (!sf) {
+        perror("Failed to create offline encryption script");
+        return -1;
+    }
+    
+    fprintf(sf, "#!/bin/bash\n");
+    fprintf(sf, "set -e\n\n");
+    fprintf(sf, "# Configuration (custom-generated for this system)\n");
+    fprintf(sf, "ROOT_DEV=\"%s\"\n", root_dev_path);
+    fprintf(sf, "BOOT_DEV=\"%s\"\n", boot_dev_path);
+    fprintf(sf, "FS_TYPE=\"%s\"\n\n", fstype);
+    fprintf(sf, "if [ \"$EUID\" -ne 0 ]; then\n");
+    fprintf(sf, "    echo \"Error: Please run this script as root (sudo).\"\n");
+    fprintf(sf, "    exit 1\n");
+    fprintf(sf, "fi\n\n");
+    fprintf(sf, "echo \"==========================================================\"\n");
+    fprintf(sf, "echo \"Offline In-Place LUKS Encryption Script for CachyOS/Arch\"\n");
+    fprintf(sf, "echo \"==========================================================\"\n");
+    fprintf(sf, "echo \"Target Partition: $ROOT_DEV ($FS_TYPE)\"\n");
+    fprintf(sf, "echo \"Boot Partition: $BOOT_DEV\"\n");
+    fprintf(sf, "echo \"==========================================================\"\n");
+    fprintf(sf, "echo \"\"\n");
+    fprintf(sf, "echo \"⚠️ WARNING: This script modifies filesystem headers and re-encrypts\"\n");
+    fprintf(sf, "echo \"your root partition in-place. Ensure you have backed up any critical data.\"\n");
+    fprintf(sf, "echo \"\"\n");
+    fprintf(sf, "read -p \"Are you sure you want to proceed? (yes/no): \" CONFIRM\n");
+    fprintf(sf, "if [ \"$CONFIRM\" != \"yes\" ]; then\n");
+    fprintf(sf, "    echo \"Aborted.\"\n");
+    fprintf(sf, "    exit 0\n");
+    fprintf(sf, "fi\n\n");
+    fprintf(sf, "echo \"Step 1: Shrinking $FS_TYPE filesystem on $ROOT_DEV by 32MB...\"\n");
+    fprintf(sf, "mkdir -p /tmp/mnt_root\n");
+    fprintf(sf, "mount \"$ROOT_DEV\" /tmp/mnt_root\n");
+    if (strcmp(fstype, "btrfs") == 0) {
+        fprintf(sf, "btrfs filesystem resize -32M /tmp/mnt_root\n");
+    } else {
+        fprintf(sf, "umount /tmp/mnt_root\n");
+        fprintf(sf, "e2fsck -f -y \"$ROOT_DEV\"\n");
+        fprintf(sf, "bytes=$(blockdev --getsize64 \"$ROOT_DEV\" 2>/dev/null)\n");
+        fprintf(sf, "new_kb=$(( (bytes / 1024) - 32768 ))\n");
+        fprintf(sf, "resize2fs \"$ROOT_DEV\" \"${new_kb}K\"\n");
+        fprintf(sf, "mount \"$ROOT_DEV\" /tmp/mnt_root\n");
+    }
+    fprintf(sf, "umount /tmp/mnt_root\n\n");
+    fprintf(sf, "echo \"Step 2: Initializing LUKS2 container on $ROOT_DEV...\"\n");
+    fprintf(sf, "echo \"You will be prompted to set the encryption passphrase.\"\n");
+    fprintf(sf, "cryptsetup reencrypt --new --encrypt --type luks2 --reduce-device-size 32m --init-only \"$ROOT_DEV\"\n\n");
+    fprintf(sf, "echo \"Step 3: Performing background re-encryption of data...\"\n");
+    fprintf(sf, "cryptsetup reencrypt \"$ROOT_DEV\"\n\n");
+    fprintf(sf, "echo \"Step 4: Opening encrypted container as 'root'...\"\n");
+    fprintf(sf, "cryptsetup open \"$ROOT_DEV\" root\n\n");
+    fprintf(sf, "echo \"Step 5: Mounting root subvolumes and boot partition...\"\n");
+    if (strcmp(fstype, "btrfs") == 0) {
+        fprintf(sf, "mount -o subvol=/@ /dev/mapper/root /tmp/mnt_root\n");
+    } else {
+        fprintf(sf, "mount /dev/mapper/root /tmp/mnt_root\n");
+    }
+    fprintf(sf, "mount \"$BOOT_DEV\" /tmp/mnt_root/boot\n\n");
+    fprintf(sf, "mount --bind /dev /tmp/mnt_root/dev\n");
+    fprintf(sf, "mount --bind /sys /tmp/mnt_root/sys\n");
+    fprintf(sf, "mount --bind /proc /tmp/mnt_root/proc\n");
+    fprintf(sf, "mount --bind /run /tmp/mnt_root/run\n\n");
+    fprintf(sf, "echo \"Step 6: Updating configuration files...\"\n");
+    fprintf(sf, "LUKS_UUID=$(blkid -o value -s UUID \"$ROOT_DEV\")\n");
+    fprintf(sf, "echo \"Updating /etc/crypttab...\"\n");
+    fprintf(sf, "echo \"root UUID=$LUKS_UUID none luks\" >> /tmp/mnt_root/etc/crypttab\n\n");
+    fprintf(sf, "echo \"Updating /etc/default/grub...\"\n");
+    fprintf(sf, "if grep -q \"cryptdevice=\" /tmp/mnt_root/etc/default/grub; then\n");
+    fprintf(sf, "    echo \"cryptdevice parameter already present in GRUB configuration.\"\n");
+    fprintf(sf, "else\n");
+    fprintf(sf, "    sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT=\"\\(.*\\)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 cryptdevice=UUID='\"$LUKS_UUID\"':root root=/dev/mapper/root\"|' /tmp/mnt_root/etc/default/grub\n");
+    fprintf(sf, "fi\n\n");
+    fprintf(sf, "echo \"Step 7: Rebuilding initramfs and GRUB configuration inside chroot...\"\n");
+    fprintf(sf, "chroot /tmp/mnt_root /bin/bash -c \"mkinitcpio -P && grub-mkconfig -o /boot/grub/grub.cfg\"\n\n");
+    fprintf(sf, "echo \"Step 8: Cleaning up mounts...\"\n");
+    fprintf(sf, "umount /tmp/mnt_root/boot\n");
+    fprintf(sf, "umount /tmp/mnt_root/dev\n");
+    fprintf(sf, "umount /tmp/mnt_root/sys\n");
+    fprintf(sf, "umount /tmp/mnt_root/proc\n");
+    fprintf(sf, "umount /tmp/mnt_root/run\n");
+    fprintf(sf, "umount /tmp/mnt_root\n\n");
+    fprintf(sf, "echo \"==========================================================\"\n");
+    fprintf(sf, "echo \"🎉 Root encryption successfully complete!\"\n");
+    fprintf(sf, "echo \"You can now reboot into your fully encrypted installation.\"\n");
+    fprintf(sf, "echo \"==========================================================\"\n");
+    
+    fclose(sf);
+    
+    chmod(script_path, 0755);
+    chown(script_path, pw->pw_uid, pw->pw_gid);
+    
+    printf("\n📝 Created ready-to-run offline root encryption script at: '%s'\n", script_path);
+    return 0;
+}
+
 void usage(const char *prog) {
     fprintf(stderr, "Usage: %s --set <username>\n", prog);
     fprintf(stderr, "       %s --delete <username>\n", prog);
@@ -777,7 +884,21 @@ int main(int argc, char **argv) {
             continue;
         }
         
-        if (strcmp(dev_name, root_dev) == 0 || strcmp(dev_name, boot_dev) == 0 || (strlen(efi_dev) > 0 && strcmp(dev_name, efi_dev) == 0)) {
+        if (strcmp(dev_name, root_dev) == 0) {
+            if (!is_luks_device(root_dev)) {
+                printf("\n💾 Found unencrypted root partition: '%s' (filesystem: %s)\n", dev_name, fstype);
+                printf("Note: Active root partition encryption must be run offline (e.g. from a Live USB).\n");
+                printf("Would you like to prepare a custom offline root encryption script in your home directory? (y/N): ");
+                fflush(stdout);
+                char ans[10] = {0};
+                if (fgets(ans, sizeof(ans), stdin) && (ans[0] == 'y' || ans[0] == 'Y')) {
+                    generate_offline_root_encryption_script(username, root_dev, boot_dev, fstype);
+                }
+            }
+            continue;
+        }
+        
+        if (strcmp(dev_name, boot_dev) == 0 || (strlen(efi_dev) > 0 && strcmp(dev_name, efi_dev) == 0)) {
             continue;
         }
         
