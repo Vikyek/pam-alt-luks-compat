@@ -409,10 +409,127 @@ int main(int argc, char **argv) {
     printf("Successfully updated keyring compatibility vault entry for user '%s'.\n", username);
 
     if (!is_luks_device(LUKS_DEV)) {
-        printf("Note: Device '%s' is not a LUKS partition. Skipping LUKS password enrollment.\n", LUKS_DEV);
-        memset(alt_pass, 0, sizeof(alt_pass));
-        memset(main_pass, 0, sizeof(main_pass));
-        return 0;
+        printf("Note: Device '%s' is not a LUKS partition.\n", LUKS_DEV);
+        printf("Would you like to initialize and start in-place LUKS encryption? (y/N): ");
+        fflush(stdout);
+        char ans[10] = {0};
+        if (fgets(ans, sizeof(ans), stdin) && (ans[0] == 'y' || ans[0] == 'Y')) {
+            printf("Starting in-place LUKS encryption initialization...\n");
+            
+            char cmd[1024];
+            system("mkdir -p /etc/cryptsetup-keys.d");
+            if (access(BACKUP_KEY_FILE, F_OK) != 0) {
+                printf("Generating a new random backup keyfile at '%s'...\n", BACKUP_KEY_FILE);
+                snprintf(cmd, sizeof(cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
+                if (system(cmd) != 0) {
+                    fprintf(stderr, "Failed to generate backup key file.\n");
+                    memset(alt_pass, 0, sizeof(alt_pass));
+                    memset(main_pass, 0, sizeof(main_pass));
+                    return 1;
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
+            system(cmd);
+
+            FILE *fp = popen("blkid -o value -s TYPE " LUKS_DEV " 2>/dev/null", "r");
+            char fstype[64] = {0};
+            if (fp) {
+                if (fgets(fstype, sizeof(fstype), fp)) {
+                    fstype[strcspn(fstype, "\n")] = '\0';
+                }
+                pclose(fp);
+            }
+
+            char mountpoint[512] = {0};
+            fp = popen("findmnt -n -o TARGET " LUKS_DEV " 2>/dev/null", "r");
+            if (fp) {
+                if (fgets(mountpoint, sizeof(mountpoint), fp)) {
+                    mountpoint[strcspn(mountpoint, "\n")] = '\0';
+                }
+                pclose(fp);
+            }
+
+            if (strlen(fstype) > 0) {
+                printf("Detected filesystem: %s on '%s'\n", fstype, LUKS_DEV);
+                if (strcmp(fstype, "btrfs") == 0) {
+                    if (strlen(mountpoint) > 0) {
+                        printf("Shrinking Btrfs filesystem online at '%s'...\n", mountpoint);
+                        snprintf(cmd, sizeof(cmd), "btrfs filesystem resize -32M %s", mountpoint);
+                        system(cmd);
+                    } else {
+                        printf("Btrfs filesystem is not mounted. Mounting temporarily to shrink...\n");
+                        system("mkdir -p /tmp/mnt_shrink");
+                        snprintf(cmd, sizeof(cmd), "mount " LUKS_DEV " /tmp/mnt_shrink && btrfs filesystem resize -32M /tmp/mnt_shrink && umount /tmp/mnt_shrink");
+                        system(cmd);
+                    }
+                } else if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext3") == 0 || strcmp(fstype, "ext2") == 0) {
+                    if (strlen(mountpoint) > 0) {
+                        printf("Unmounting '%s' to shrink ext4 filesystem...\n", mountpoint);
+                        snprintf(cmd, sizeof(cmd), "umount %s", mountpoint);
+                        system(cmd);
+                    }
+                    printf("Running filesystem check on '%s'...\n", LUKS_DEV);
+                    snprintf(cmd, sizeof(cmd), "e2fsck -f -y %s", LUKS_DEV);
+                    system(cmd);
+
+                    fp = popen("blockdev --getsize64 " LUKS_DEV " 2>/dev/null", "r");
+                    long long bytes = 0;
+                    if (fp) {
+                        if (fscanf(fp, "%lld", &bytes) != 1) bytes = 0;
+                        pclose(fp);
+                    }
+                    if (bytes > 0) {
+                        long long new_kb = (bytes / 1024) - 32768;
+                        printf("Shrinking ext4 filesystem to %lld KB...\n", new_kb);
+                        snprintf(cmd, sizeof(cmd), "resize2fs %s %lldK", LUKS_DEV, new_kb);
+                        system(cmd);
+                    } else {
+                        fprintf(stderr, "Failed to determine device size for shrinking.\n");
+                        memset(alt_pass, 0, sizeof(alt_pass));
+                        memset(main_pass, 0, sizeof(main_pass));
+                        return 1;
+                    }
+                } else {
+                    printf("Unsupported filesystem type '%s' for automatic shrinking. You must shrink it manually.\n", fstype);
+                }
+            }
+
+            snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null || true", LUKS_DEV);
+            system(cmd);
+
+            printf("Initializing in-place LUKS encryption on '%s'...\n", LUKS_DEV);
+            snprintf(cmd, sizeof(cmd), "cryptsetup reencrypt --new --encrypt --type luks2 --reduce-device-size 32m --init-only --key-file %s %s", KEY_FILE, LUKS_DEV);
+            if (system(cmd) != 0) {
+                fprintf(stderr, "Failed to initialize LUKS encryption on '%s'.\n", LUKS_DEV);
+                memset(alt_pass, 0, sizeof(alt_pass));
+                memset(main_pass, 0, sizeof(main_pass));
+                return 1;
+            }
+
+            printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
+            FILE *tf = fopen(TEMP_KEYS_PATH, "w");
+            if (tf) {
+                chmod(TEMP_KEYS_PATH, 0600);
+                fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
+                fclose(tf);
+            }
+
+            printf("Starting background encryption process...\n");
+            snprintf(cmd, sizeof(cmd), "nohup cryptsetup reencrypt %s >/dev/null 2>&1 &", LUKS_DEV);
+            system(cmd);
+
+            printf("\n🎉 Encryption successfully initialized and started in the background!\n");
+            printf("You can monitor the progress by running: sudo crypt-progress\n");
+            
+            memset(alt_pass, 0, sizeof(alt_pass));
+            memset(main_pass, 0, sizeof(main_pass));
+            return 0;
+        } else {
+            printf("Skipping LUKS encryption initialization. Keyring Compatibility Vault updated.\n");
+            memset(alt_pass, 0, sizeof(alt_pass));
+            memset(main_pass, 0, sizeof(main_pass));
+            return 0;
+        }
     }
 
     printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", LUKS_DEV);
