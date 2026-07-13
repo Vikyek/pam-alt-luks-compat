@@ -12,6 +12,7 @@
 #define TEMP_KEYS_PATH "/run/luks_keys_to_add.tmp"
 #define LUKS_DEV "/dev/sdc1"
 #define KEY_FILE "/etc/cryptsetup-keys.d/data.key"
+#define BACKUP_KEY_FILE "/etc/cryptsetup-keys.d/data.key.backup"
 
 struct vault_record {
     char username[32];
@@ -181,6 +182,29 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const cha
 #else
 
 // CLI Tool implementation
+int is_luks_device(const char *dev) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "cryptsetup isLuks %s 2>/dev/null", dev);
+    return system(cmd) == 0;
+}
+
+int is_luks_reencrypting(const char *dev) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "cryptsetup luksDump %s 2>/dev/null", dev);
+    FILE *dp = popen(cmd, "r");
+    if (!dp) return 0;
+    char line[256];
+    int reencrypting = 0;
+    while (fgets(line, sizeof(line), dp)) {
+        if (strstr(line, "reencrypt")) {
+            reencrypting = 1;
+            break;
+        }
+    }
+    pclose(dp);
+    return reencrypting;
+}
+
 void usage(const char *prog) {
     fprintf(stderr, "Usage: %s --set <username>\n", prog);
     fprintf(stderr, "       %s --delete <username>\n", prog);
@@ -384,23 +408,39 @@ int main(int argc, char **argv) {
 
     printf("Successfully updated keyring compatibility vault entry for user '%s'.\n", username);
 
+    if (!is_luks_device(LUKS_DEV)) {
+        printf("Note: Device '%s' is not a LUKS partition. Skipping LUKS password enrollment.\n", LUKS_DEV);
+        memset(alt_pass, 0, sizeof(alt_pass));
+        memset(main_pass, 0, sizeof(main_pass));
+        return 0;
+    }
+
     printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", LUKS_DEV);
-    int alt_res = enroll_luks_key(LUKS_DEV, KEY_FILE, alt_pass);
-    int main_res = enroll_luks_key(LUKS_DEV, KEY_FILE, main_pass);
+    const char *auth_key = BACKUP_KEY_FILE;
+    if (access(BACKUP_KEY_FILE, F_OK) != 0) {
+        auth_key = KEY_FILE;
+    }
+
+    int alt_res = enroll_luks_key(LUKS_DEV, auth_key, alt_pass);
+    int main_res = enroll_luks_key(LUKS_DEV, auth_key, main_pass);
 
     if (alt_res == 0 && main_res == 0) {
         printf("Successfully enrolled alternative and main passwords into LUKS slots.\n");
     } else {
-        printf("LUKS device is currently busy/locked (encryption in progress).\n");
-        printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
-        FILE *tf = fopen(TEMP_KEYS_PATH, "w");
-        if (tf) {
-            chmod(TEMP_KEYS_PATH, 0600);
-            fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
-            fclose(tf);
-            printf("Passwords successfully queued. They will be automatically enrolled once background encryption finishes.\n");
+        if (is_luks_reencrypting(LUKS_DEV)) {
+            printf("LUKS device is currently busy/locked (encryption in progress).\n");
+            printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
+            FILE *tf = fopen(TEMP_KEYS_PATH, "w");
+            if (tf) {
+                chmod(TEMP_KEYS_PATH, 0600);
+                fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
+                fclose(tf);
+                printf("Passwords successfully queued. They will be automatically enrolled once background encryption finishes.\n");
+            } else {
+                perror("Failed to save passwords to temporary cache");
+            }
         } else {
-            perror("Failed to save passwords to temporary cache");
+            fprintf(stderr, "Error: Failed to enroll passwords to LUKS partition '%s' (check if key file '%s' exists and is correct).\n", LUKS_DEV, auth_key);
         }
     }
 

@@ -437,6 +437,7 @@ def main():
             proc_val = f"{hex_to_ansi(v_theme['processed'])}{c_len / (1024**3):.2f} GiB{reset} / {total / (1024**3):.2f} GiB"
             speed_val = f"{hex_to_ansi(v_theme['speed'])}{speed_str}{reset}"
             eta_val = f"{hex_to_ansi(v_theme['eta'])}{eta_str}{reset}"
+            status_ansi = hex_to_ansi(v_theme["status"])
             
             # Evaluate status finalization
             if complete:
