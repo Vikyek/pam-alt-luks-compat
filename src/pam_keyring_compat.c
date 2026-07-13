@@ -116,7 +116,7 @@ int enroll_luks_key_with_keyfile(const char *dev, const char *key_file, const ch
     int new_fd = mkstemp(new_temp);
     if (new_fd < 0) return -1;
     
-    if (write(new_fd, new_pass, strlen(new_pass)) < 0 || write(new_fd, "\n", 1) < 0) {
+    if (write(new_fd, new_pass, strlen(new_pass)) < 0) {
         close(new_fd);
         unlink(new_temp);
         return -1;
@@ -144,8 +144,8 @@ int enroll_luks_key_with_passphrase(const char *dev, const char *existing_pass, 
         return -1;
     }
     
-    if (write(old_fd, existing_pass, strlen(existing_pass)) < 0 || write(old_fd, "\n", 1) < 0 ||
-        write(new_fd, new_pass, strlen(new_pass)) < 0 || write(new_fd, "\n", 1) < 0) {
+    if (write(old_fd, existing_pass, strlen(existing_pass)) < 0 ||
+        write(new_fd, new_pass, strlen(new_pass)) < 0) {
         close(old_fd); close(new_fd);
         unlink(old_temp); unlink(new_temp);
         return -1;
@@ -167,7 +167,7 @@ int enroll_luks_keyfile_with_passphrase(const char *dev, const char *existing_pa
     int old_fd = mkstemp(old_temp);
     if (old_fd < 0) return -1;
     
-    if (write(old_fd, existing_pass, strlen(existing_pass)) < 0 || write(old_fd, "\n", 1) < 0) {
+    if (write(old_fd, existing_pass, strlen(existing_pass)) < 0) {
         close(old_fd);
         unlink(old_temp);
         return -1;
@@ -266,6 +266,243 @@ int is_luks_reencrypting(const char *dev) {
     }
     pclose(dp);
     return reencrypting;
+}
+
+int ensure_keyfiles_exist(const char *dev) {
+    int keyfiles_exist = (access(BACKUP_KEY_FILE, F_OK) == 0 || access(KEY_FILE, F_OK) == 0);
+    if (!keyfiles_exist) {
+        printf("\033[93m⚠\033[0m Key files for auto-unlock do not exist.\n");
+        printf("Generating new random keyfile at '%s'...\n", BACKUP_KEY_FILE);
+        
+        system("mkdir -p /etc/cryptsetup-keys.d");
+        
+        char key_gen_cmd[1024];
+        snprintf(key_gen_cmd, sizeof(key_gen_cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
+        if (system(key_gen_cmd) != 0) {
+            fprintf(stderr, "Error: Failed to generate backup key file.\n");
+            return -1;
+        }
+        
+        char existing_pass[128] = {0};
+        printf("Enter existing LUKS passphrase for '%s' to authorize the keyfile: ", dev);
+        fflush(stdout);
+        
+        struct termios oldt, newt;
+        int is_tty = isatty(STDIN_FILENO);
+        if (is_tty) {
+            tcgetattr(STDIN_FILENO, &oldt);
+            newt = oldt;
+            newt.c_lflag &= ~(ECHO);
+            tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        }
+        if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
+            existing_pass[strcspn(existing_pass, "\n")] = '\0';
+        }
+        if (is_tty) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            printf("\n");
+        }
+        
+        int res = enroll_luks_keyfile_with_passphrase(dev, existing_pass, BACKUP_KEY_FILE);
+        memset(existing_pass, 0, sizeof(existing_pass));
+        
+        if (res == 0) {
+            printf("Successfully enrolled auto-unlock keyfile into LUKS.\n");
+            snprintf(key_gen_cmd, sizeof(key_gen_cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
+            system(key_gen_cmd);
+            return 0;
+        } else {
+            fprintf(stderr, "\033[91mError: Failed to authorize keyfile (incorrect passphrase).\033[0m\n");
+            unlink(BACKUP_KEY_FILE);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int process_luks_enrollment(const char *dev, const char *alt_pass, const char *main_pass) {
+    if (ensure_keyfiles_exist(dev) != 0) {
+        return -1;
+    }
+    
+    printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", dev);
+    const char *auth_key = BACKUP_KEY_FILE;
+    if (access(BACKUP_KEY_FILE, F_OK) != 0) {
+        auth_key = KEY_FILE;
+    }
+
+    int alt_res = -1;
+    int main_res = -1;
+    if (auth_key && access(auth_key, F_OK) == 0) {
+        alt_res = enroll_luks_key_with_keyfile(dev, auth_key, alt_pass);
+        main_res = enroll_luks_key_with_keyfile(dev, auth_key, main_pass);
+    }
+
+    if (alt_res != 0 || main_res != 0) {
+        if (is_luks_reencrypting(dev)) {
+            printf("LUKS device '%s' is currently busy/locked (encryption in progress).\n", dev);
+            printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
+            FILE *tf = fopen(TEMP_KEYS_PATH, "w");
+            if (tf) {
+                chmod(TEMP_KEYS_PATH, 0600);
+                fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
+                fclose(tf);
+                printf("Passwords successfully queued. They will be automatically enrolled once background encryption finishes.\n");
+            } else {
+                perror("Failed to save passwords to temporary cache");
+            }
+            return 0;
+        } else {
+            printf("\033[93m⚠\033[0m Keyfile authorization failed for '%s'. Fallback to manual LUKS passphrase.\n", dev);
+            char existing_pass[128] = {0};
+            printf("Enter existing LUKS passphrase for '%s': ", dev);
+            fflush(stdout);
+            
+            struct termios oldt, newt;
+            int is_tty = isatty(STDIN_FILENO);
+            if (is_tty) {
+                tcgetattr(STDIN_FILENO, &oldt);
+                newt = oldt;
+                newt.c_lflag &= ~(ECHO);
+                tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+            }
+            if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
+                existing_pass[strcspn(existing_pass, "\n")] = '\0';
+            }
+            if (is_tty) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+                printf("\n");
+            }
+            
+            alt_res = enroll_luks_key_with_passphrase(dev, existing_pass, alt_pass);
+            main_res = enroll_luks_key_with_passphrase(dev, existing_pass, main_pass);
+            
+            if (alt_res == 0 && main_res == 0) {
+                printf("Successfully enrolled alternative and main passwords into '%s' using passphrase.\n", dev);
+                
+                printf("Re-creating auto-unlock keyfiles...\n");
+                system("mkdir -p /etc/cryptsetup-keys.d");
+                char gen_cmd[1024];
+                snprintf(gen_cmd, sizeof(gen_cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
+                if (system(gen_cmd) == 0) {
+                    int enroll_kf_res = enroll_luks_keyfile_with_passphrase(dev, existing_pass, BACKUP_KEY_FILE);
+                    if (enroll_kf_res == 0) {
+                        snprintf(gen_cmd, sizeof(gen_cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
+                        system(gen_cmd);
+                        printf("Successfully re-created and enrolled auto-unlock keyfile.\n");
+                    } else {
+                        fprintf(stderr, "Warning: Failed to enroll the newly generated keyfile into LUKS.\n");
+                        unlink(BACKUP_KEY_FILE);
+                    }
+                }
+            } else {
+                fprintf(stderr, "\033[91mError: Failed to enroll passwords (incorrect passphrase or system error).\033[0m\n");
+                memset(existing_pass, 0, sizeof(existing_pass));
+                return -1;
+            }
+            memset(existing_pass, 0, sizeof(existing_pass));
+        }
+    } else {
+        printf("Successfully enrolled alternative and main passwords into '%s' LUKS slots.\n", dev);
+    }
+    return 0;
+}
+
+int attempt_inplace_encryption(const char *dev, const char *fstype, const char *alt_pass, const char *main_pass) {
+    printf("Starting in-place LUKS encryption initialization on '%s'...\n", dev);
+    
+    char cmd[1024];
+    system("mkdir -p /etc/cryptsetup-keys.d");
+    if (access(BACKUP_KEY_FILE, F_OK) != 0) {
+        printf("Generating a new random backup keyfile at '%s'...\n", BACKUP_KEY_FILE);
+        snprintf(cmd, sizeof(cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
+        if (system(cmd) != 0) {
+            fprintf(stderr, "Failed to generate backup key file.\n");
+            return -1;
+        }
+    }
+    snprintf(cmd, sizeof(cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
+    system(cmd);
+
+    char mountpoint[512] = {0};
+    snprintf(cmd, sizeof(cmd), "findmnt -n -o TARGET %s 2>/dev/null", dev);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(mountpoint, sizeof(mountpoint), fp)) {
+            mountpoint[strcspn(mountpoint, "\n")] = '\0';
+        }
+        pclose(fp);
+    }
+
+    if (strlen(fstype) > 0) {
+        printf("Detected filesystem: %s on '%s'\n", fstype, dev);
+        if (strcmp(fstype, "btrfs") == 0) {
+            if (strlen(mountpoint) > 0) {
+                printf("Shrinking Btrfs filesystem online at '%s'...\n", mountpoint);
+                snprintf(cmd, sizeof(cmd), "btrfs filesystem resize -32M %s", mountpoint);
+                system(cmd);
+            } else {
+                printf("Btrfs filesystem is not mounted. Mounting temporarily to shrink...\n");
+                system("mkdir -p /tmp/mnt_shrink");
+                snprintf(cmd, sizeof(cmd), "mount %s /tmp/mnt_shrink && btrfs filesystem resize -32M /tmp/mnt_shrink && umount /tmp/mnt_shrink", dev);
+                system(cmd);
+            }
+        } else if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext3") == 0 || strcmp(fstype, "ext2") == 0) {
+            if (strlen(mountpoint) > 0) {
+                printf("Unmounting '%s' to shrink ext4 filesystem...\n", mountpoint);
+                snprintf(cmd, sizeof(cmd), "umount %s", mountpoint);
+                system(cmd);
+            }
+            printf("Running filesystem check on '%s'...\n", dev);
+            snprintf(cmd, sizeof(cmd), "e2fsck -f -y %s", dev);
+            system(cmd);
+
+            snprintf(cmd, sizeof(cmd), "blockdev --getsize64 %s 2>/dev/null", dev);
+            fp = popen(cmd, "r");
+            long long bytes = 0;
+            if (fp) {
+                if (fscanf(fp, "%lld", &bytes) != 1) bytes = 0;
+                pclose(fp);
+            }
+            if (bytes > 0) {
+                long long new_kb = (bytes / 1024) - 32768;
+                printf("Shrinking ext4 filesystem to %lld KB...\n", new_kb);
+                snprintf(cmd, sizeof(cmd), "resize2fs %s %lldK", dev, new_kb);
+                system(cmd);
+            } else {
+                fprintf(stderr, "Failed to determine device size for shrinking.\n");
+                return -1;
+            }
+        } else {
+            printf("Unsupported filesystem type '%s' for automatic shrinking. You must shrink it manually.\n", fstype);
+        }
+    }
+
+    snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null || true", dev);
+    system(cmd);
+
+    printf("Initializing in-place LUKS encryption on '%s'...\n", dev);
+    snprintf(cmd, sizeof(cmd), "cryptsetup reencrypt --new --encrypt --type luks2 --reduce-device-size 32m --init-only --key-file %s %s", KEY_FILE, dev);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Failed to initialize LUKS encryption on '%s'.\n", dev);
+        return -1;
+    }
+
+    printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
+    FILE *tf = fopen(TEMP_KEYS_PATH, "w");
+    if (tf) {
+        chmod(TEMP_KEYS_PATH, 0600);
+        fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
+        fclose(tf);
+    }
+
+    printf("Starting background encryption process...\n");
+    snprintf(cmd, sizeof(cmd), "nohup cryptsetup reencrypt %s >/dev/null 2>&1 &", dev);
+    system(cmd);
+
+    printf("\n🎉 Encryption successfully initialized and started in the background on '%s'!\n", dev);
+    printf("You can monitor the progress by running: sudo crypt-progress\n");
+    return 0;
 }
 
 void usage(const char *prog) {
@@ -471,263 +708,102 @@ int main(int argc, char **argv) {
 
     printf("Successfully updated keyring compatibility vault entry for user '%s'.\n", username);
 
-    if (!is_luks_device(LUKS_DEV)) {
-        printf("Note: Device '%s' is not a LUKS partition.\n", LUKS_DEV);
-        printf("Would you like to initialize and start in-place LUKS encryption? (y/N): ");
-        fflush(stdout);
-        char ans[10] = {0};
-        if (fgets(ans, sizeof(ans), stdin) && (ans[0] == 'y' || ans[0] == 'Y')) {
-            printf("Starting in-place LUKS encryption initialization...\n");
-            
-            char cmd[1024];
-            system("mkdir -p /etc/cryptsetup-keys.d");
-            if (access(BACKUP_KEY_FILE, F_OK) != 0) {
-                printf("Generating a new random backup keyfile at '%s'...\n", BACKUP_KEY_FILE);
-                snprintf(cmd, sizeof(cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
-                if (system(cmd) != 0) {
-                    fprintf(stderr, "Failed to generate backup key file.\n");
-                    memset(alt_pass, 0, sizeof(alt_pass));
-                    memset(main_pass, 0, sizeof(main_pass));
-                    return 1;
-                }
-            }
-            snprintf(cmd, sizeof(cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
-            system(cmd);
+    char root_dev[256] = {0};
+    char boot_dev[256] = {0};
+    char efi_dev[256] = {0};
 
-            FILE *fp = popen("blkid -o value -s TYPE " LUKS_DEV " 2>/dev/null", "r");
-            char fstype[64] = {0};
-            if (fp) {
-                if (fgets(fstype, sizeof(fstype), fp)) {
-                    fstype[strcspn(fstype, "\n")] = '\0';
-                }
-                pclose(fp);
-            }
-
-            char mountpoint[512] = {0};
-            fp = popen("findmnt -n -o TARGET " LUKS_DEV " 2>/dev/null", "r");
-            if (fp) {
-                if (fgets(mountpoint, sizeof(mountpoint), fp)) {
-                    mountpoint[strcspn(mountpoint, "\n")] = '\0';
-                }
-                pclose(fp);
-            }
-
-            if (strlen(fstype) > 0) {
-                printf("Detected filesystem: %s on '%s'\n", fstype, LUKS_DEV);
-                if (strcmp(fstype, "btrfs") == 0) {
-                    if (strlen(mountpoint) > 0) {
-                        printf("Shrinking Btrfs filesystem online at '%s'...\n", mountpoint);
-                        snprintf(cmd, sizeof(cmd), "btrfs filesystem resize -32M %s", mountpoint);
-                        system(cmd);
-                    } else {
-                        printf("Btrfs filesystem is not mounted. Mounting temporarily to shrink...\n");
-                        system("mkdir -p /tmp/mnt_shrink");
-                        snprintf(cmd, sizeof(cmd), "mount " LUKS_DEV " /tmp/mnt_shrink && btrfs filesystem resize -32M /tmp/mnt_shrink && umount /tmp/mnt_shrink");
-                        system(cmd);
-                    }
-                } else if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext3") == 0 || strcmp(fstype, "ext2") == 0) {
-                    if (strlen(mountpoint) > 0) {
-                        printf("Unmounting '%s' to shrink ext4 filesystem...\n", mountpoint);
-                        snprintf(cmd, sizeof(cmd), "umount %s", mountpoint);
-                        system(cmd);
-                    }
-                    printf("Running filesystem check on '%s'...\n", LUKS_DEV);
-                    snprintf(cmd, sizeof(cmd), "e2fsck -f -y %s", LUKS_DEV);
-                    system(cmd);
-
-                    fp = popen("blockdev --getsize64 " LUKS_DEV " 2>/dev/null", "r");
-                    long long bytes = 0;
-                    if (fp) {
-                        if (fscanf(fp, "%lld", &bytes) != 1) bytes = 0;
-                        pclose(fp);
-                    }
-                    if (bytes > 0) {
-                        long long new_kb = (bytes / 1024) - 32768;
-                        printf("Shrinking ext4 filesystem to %lld KB...\n", new_kb);
-                        snprintf(cmd, sizeof(cmd), "resize2fs %s %lldK", LUKS_DEV, new_kb);
-                        system(cmd);
-                    } else {
-                        fprintf(stderr, "Failed to determine device size for shrinking.\n");
-                        memset(alt_pass, 0, sizeof(alt_pass));
-                        memset(main_pass, 0, sizeof(main_pass));
-                        return 1;
-                    }
-                } else {
-                    printf("Unsupported filesystem type '%s' for automatic shrinking. You must shrink it manually.\n", fstype);
-                }
-            }
-
-            snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null || true", LUKS_DEV);
-            system(cmd);
-
-            printf("Initializing in-place LUKS encryption on '%s'...\n", LUKS_DEV);
-            snprintf(cmd, sizeof(cmd), "cryptsetup reencrypt --new --encrypt --type luks2 --reduce-device-size 32m --init-only --key-file %s %s", KEY_FILE, LUKS_DEV);
-            if (system(cmd) != 0) {
-                fprintf(stderr, "Failed to initialize LUKS encryption on '%s'.\n", LUKS_DEV);
-                memset(alt_pass, 0, sizeof(alt_pass));
-                memset(main_pass, 0, sizeof(main_pass));
-                return 1;
-            }
-
-            printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
-            FILE *tf = fopen(TEMP_KEYS_PATH, "w");
-            if (tf) {
-                chmod(TEMP_KEYS_PATH, 0600);
-                fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
-                fclose(tf);
-            }
-
-            printf("Starting background encryption process...\n");
-            snprintf(cmd, sizeof(cmd), "nohup cryptsetup reencrypt %s >/dev/null 2>&1 &", LUKS_DEV);
-            system(cmd);
-
-            printf("\n🎉 Encryption successfully initialized and started in the background!\n");
-            printf("You can monitor the progress by running: sudo crypt-progress\n");
-            
-            memset(alt_pass, 0, sizeof(alt_pass));
-            memset(main_pass, 0, sizeof(main_pass));
-            return 0;
-        } else {
-            printf("Skipping LUKS encryption initialization. Keyring Compatibility Vault updated.\n");
-            memset(alt_pass, 0, sizeof(alt_pass));
-            memset(main_pass, 0, sizeof(main_pass));
-            return 0;
+    FILE *rf = popen("findmnt -n -o SOURCE / | sed 's/\\[.*//' 2>/dev/null", "r");
+    if (rf) {
+        if (fgets(root_dev, sizeof(root_dev), rf)) {
+            root_dev[strcspn(root_dev, "\n")] = '\0';
         }
+        pclose(rf);
     }
 
-    int keyfiles_exist = (access(BACKUP_KEY_FILE, F_OK) == 0 || access(KEY_FILE, F_OK) == 0);
-    if (!keyfiles_exist) {
-        printf("\033[93m⚠\033[0m Key files for auto-unlock do not exist.\n");
-        printf("Generating new random keyfile at '%s'...\n", BACKUP_KEY_FILE);
-        
-        system("mkdir -p /etc/cryptsetup-keys.d");
-        
-        char key_gen_cmd[1024];
-        snprintf(key_gen_cmd, sizeof(key_gen_cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
-        if (system(key_gen_cmd) != 0) {
-            fprintf(stderr, "Error: Failed to generate backup key file.\n");
-            memset(alt_pass, 0, sizeof(alt_pass));
-            memset(main_pass, 0, sizeof(main_pass));
-            return 1;
+    FILE *bf = popen("findmnt -n -o SOURCE /boot | sed 's/\\[.*//' 2>/dev/null", "r");
+    if (bf) {
+        if (fgets(boot_dev, sizeof(boot_dev), bf)) {
+            boot_dev[strcspn(boot_dev, "\n")] = '\0';
         }
-        
-        char existing_pass[128] = {0};
-        printf("Enter existing LUKS passphrase for '%s' to authorize the keyfile: ", LUKS_DEV);
-        fflush(stdout);
-        
-        struct termios oldt, newt;
-        int is_tty = isatty(STDIN_FILENO);
-        if (is_tty) {
-            tcgetattr(STDIN_FILENO, &oldt);
-            newt = oldt;
-            newt.c_lflag &= ~(ECHO);
-            tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-        }
-        if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
-            existing_pass[strcspn(existing_pass, "\n")] = '\0';
-        }
-        if (is_tty) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-            printf("\n");
-        }
-        
-        int res = enroll_luks_keyfile_with_passphrase(LUKS_DEV, existing_pass, BACKUP_KEY_FILE);
-        if (res == 0) {
-            printf("Successfully enrolled auto-unlock keyfile into LUKS.\n");
-            snprintf(key_gen_cmd, sizeof(key_gen_cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
-            system(key_gen_cmd);
-        } else {
-            fprintf(stderr, "\033[91mError: Failed to authorize keyfile (incorrect passphrase).\033[0m\n");
-            unlink(BACKUP_KEY_FILE);
-            memset(existing_pass, 0, sizeof(existing_pass));
-            memset(alt_pass, 0, sizeof(alt_pass));
-            memset(main_pass, 0, sizeof(main_pass));
-            return 1;
-        }
-        memset(existing_pass, 0, sizeof(existing_pass));
+        pclose(bf);
     }
 
-    printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", LUKS_DEV);
-    const char *auth_key = BACKUP_KEY_FILE;
-    if (access(BACKUP_KEY_FILE, F_OK) != 0) {
-        auth_key = KEY_FILE;
-    }
-
-    int alt_res = -1;
-    int main_res = -1;
-    if (auth_key && access(auth_key, F_OK) == 0) {
-        alt_res = enroll_luks_key_with_keyfile(LUKS_DEV, auth_key, alt_pass);
-        main_res = enroll_luks_key_with_keyfile(LUKS_DEV, auth_key, main_pass);
-    }
-
-    if (alt_res != 0 || main_res != 0) {
-        if (is_luks_reencrypting(LUKS_DEV)) {
-            printf("LUKS device is currently busy/locked (encryption in progress).\n");
-            printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
-            FILE *tf = fopen(TEMP_KEYS_PATH, "w");
-            if (tf) {
-                chmod(TEMP_KEYS_PATH, 0600);
-                fprintf(tf, "%s\n%s\n", alt_pass, main_pass);
-                fclose(tf);
-                printf("Passwords successfully queued. They will be automatically enrolled once background encryption finishes.\n");
-            } else {
-                perror("Failed to save passwords to temporary cache");
+    FILE *ef = popen("findmnt -n -o SOURCE /boot/efi | sed 's/\\[.*//' 2>/dev/null", "r");
+    if (!ef || !fgets(efi_dev, sizeof(efi_dev), ef)) {
+        if (ef) pclose(ef);
+        ef = popen("findmnt -n -o SOURCE /efi | sed 's/\\[.*//' 2>/dev/null", "r");
+        if (ef) {
+            if (fgets(efi_dev, sizeof(efi_dev), ef)) {
+                efi_dev[strcspn(efi_dev, "\n")] = '\0';
             }
-        } else {
-            printf("\033[93m⚠\033[0m Keyfile authorization failed. Fallback to manual LUKS passphrase.\n");
-            char existing_pass[128] = {0};
-            printf("Enter existing LUKS passphrase for '%s': ", LUKS_DEV);
-            fflush(stdout);
-            
-            struct termios oldt, newt;
-            int is_tty = isatty(STDIN_FILENO);
-            if (is_tty) {
-                tcgetattr(STDIN_FILENO, &oldt);
-                newt = oldt;
-                newt.c_lflag &= ~(ECHO);
-                tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-            }
-            if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
-                existing_pass[strcspn(existing_pass, "\n")] = '\0';
-            }
-            if (is_tty) {
-                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-                printf("\n");
-            }
-            
-            alt_res = enroll_luks_key_with_passphrase(LUKS_DEV, existing_pass, alt_pass);
-            main_res = enroll_luks_key_with_passphrase(LUKS_DEV, existing_pass, main_pass);
-            
-            if (alt_res == 0 && main_res == 0) {
-                printf("Successfully enrolled alternative and main passwords using passphrase.\n");
-                
-                printf("Re-creating auto-unlock keyfiles...\n");
-                system("mkdir -p /etc/cryptsetup-keys.d");
-                char gen_cmd[1024];
-                snprintf(gen_cmd, sizeof(gen_cmd), "dd if=/dev/urandom of=%s bs=512 count=1 status=none && chmod 400 %s", BACKUP_KEY_FILE, BACKUP_KEY_FILE);
-                if (system(gen_cmd) == 0) {
-                    int enroll_kf_res = enroll_luks_keyfile_with_passphrase(LUKS_DEV, existing_pass, BACKUP_KEY_FILE);
-                    if (enroll_kf_res == 0) {
-                        snprintf(gen_cmd, sizeof(gen_cmd), "cp %s %s && chmod 400 %s", BACKUP_KEY_FILE, KEY_FILE, KEY_FILE);
-                        system(gen_cmd);
-                        printf("Successfully re-created and enrolled auto-unlock keyfile.\n");
-                    } else {
-                        fprintf(stderr, "Warning: Failed to enroll the newly generated keyfile into LUKS.\n");
-                        unlink(BACKUP_KEY_FILE);
-                    }
-                }
-            } else {
-                fprintf(stderr, "\033[91mError: Failed to enroll passwords (incorrect passphrase or system error).\033[0m\n");
-            }
-            memset(existing_pass, 0, sizeof(existing_pass));
+            pclose(ef);
         }
     } else {
-        printf("Successfully enrolled alternative and main passwords into LUKS slots.\n");
+        efi_dev[strcspn(efi_dev, "\n")] = '\0';
+        pclose(ef);
+    }
+
+    FILE *lp = popen("lsblk -p -n -r -o NAME,FSTYPE,TYPE 2>/dev/null", "r");
+    if (!lp) {
+        perror("Failed to list block devices");
+        memset(alt_pass, 0, sizeof(alt_pass));
+        memset(main_pass, 0, sizeof(main_pass));
+        return 1;
+    }
+
+    char line[512];
+    int processed_any = 0;
+    while (fgets(line, sizeof(line), lp)) {
+        char dev_name[256] = {0};
+        char fstype[128] = {0};
+        char type[64] = {0};
+        
+        int fields = sscanf(line, "%255s %127s %63s", dev_name, fstype, type);
+        if (fields < 3) {
+            fields = sscanf(line, "%255s %63s", dev_name, type);
+            if (fields == 2 && (strcmp(type, "part") == 0 || strcmp(type, "disk") == 0)) {
+                strcpy(fstype, "");
+            } else {
+                continue;
+            }
+        } else {
+            if (strcmp(fstype, "part") == 0 || strcmp(fstype, "disk") == 0) {
+                strcpy(type, fstype);
+                strcpy(fstype, "");
+            }
+        }
+        
+        if (strcmp(type, "part") != 0) {
+            continue;
+        }
+        
+        if (strcmp(dev_name, root_dev) == 0 || strcmp(dev_name, boot_dev) == 0 || (strlen(efi_dev) > 0 && strcmp(dev_name, efi_dev) == 0)) {
+            continue;
+        }
+        
+        processed_any = 1;
+        if (is_luks_device(dev_name)) {
+            process_luks_enrollment(dev_name, alt_pass, main_pass);
+        } else {
+            printf("\n💾 Found unencrypted partition: '%s' (filesystem: %s)\n", dev_name, fstype);
+            printf("Would you like to initialize and start in-place LUKS encryption on '%s'? (y/N): ", dev_name);
+            fflush(stdout);
+            char ans[10] = {0};
+            if (fgets(ans, sizeof(ans), stdin) && (ans[0] == 'y' || ans[0] == 'Y')) {
+                attempt_inplace_encryption(dev_name, fstype, alt_pass, main_pass);
+            } else {
+                printf("Skipping LUKS encryption initialization on '%s'.\n", dev_name);
+            }
+        }
+    }
+    pclose(lp);
+
+    if (!processed_any) {
+        printf("No candidate partitions found on the system for LUKS processing/encryption.\n");
     }
 
     memset(alt_pass, 0, sizeof(alt_pass));
     memset(main_pass, 0, sizeof(main_pass));
-
     return 0;
 }
 #endif
