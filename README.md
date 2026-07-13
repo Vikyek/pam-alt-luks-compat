@@ -67,7 +67,7 @@ To configure the secure keyring compatibility vault and register/queue your pass
 ```bash
 sudo pam_keyring_compat_tool --set v
 ```
-*   *Note:* If the partition is currently encrypting, the passwords will be queued securely in memory at `/run/luks_keys_to_add.tmp` and enrolled automatically once the encryption finishes.
+*   *Note:* If the partition is not yet encrypted, the tool will offer to automatically shrink your filesystem (supporting online shrinking for Btrfs and offline for Ext2/3/4) by 32MB, generate cryptographic keys, initialize LUKS2, and launch background in-place encryption. If the partition is already encrypting, passwords are queued securely at `/run/luks_keys_to_add.tmp` and enrolled once done.
 
 ### 2. Monitoring Encryption progress
 You can watch the in-place encryption using the themed visual monitor card:
