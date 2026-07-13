@@ -183,6 +183,65 @@ int enroll_luks_keyfile_with_passphrase(const char *dev, const char *existing_pa
     return res;
 }
 
+void get_masked_password(char *buf, size_t max_len) {
+    size_t len = 0;
+    int is_tty = isatty(STDIN_FILENO);
+    struct termios oldt, newt;
+    
+    if (is_tty) {
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        newt.c_lflag &= ~(ECHO | ICANON);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    }
+    
+    while (len < max_len - 1) {
+        int ch = getchar();
+        if (ch == EOF) {
+            break;
+        }
+        if (ch == '\n' || ch == '\r') {
+            break;
+        }
+        if (ch == 127 || ch == 8) {
+            if (len > 0) {
+                len--;
+                buf[len] = '\0';
+                if (is_tty) {
+                    printf("\b \b");
+                    fflush(stdout);
+                }
+            }
+        } else {
+            buf[len++] = ch;
+            buf[len] = '\0';
+            if (is_tty) {
+                printf("*");
+                fflush(stdout);
+            }
+        }
+    }
+    
+    if (is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        printf("\n");
+    } else {
+        buf[strcspn(buf, "\n\r")] = '\0';
+    }
+}
+
+void get_device_label(const char *dev, char *label_buf, size_t max_len) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "blkid -o value -s PARTLABEL %s 2>/dev/null || blkid -o value -s LABEL %s 2>/dev/null", dev, dev);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(label_buf, max_len, fp)) {
+            label_buf[strcspn(label_buf, "\n")] = '\0';
+        }
+        pclose(fp);
+    }
+}
+
 #ifdef PAM_MODULE
 #define PAM_SM_AUTH
 #include <security/pam_appl.h>
@@ -287,22 +346,7 @@ int ensure_keyfiles_exist(const char *dev) {
         char existing_pass[128] = {0};
         printf("Enter existing LUKS passphrase for '%s' to authorize the keyfile: ", dev);
         fflush(stdout);
-        
-        struct termios oldt, newt;
-        int is_tty = isatty(STDIN_FILENO);
-        if (is_tty) {
-            tcgetattr(STDIN_FILENO, &oldt);
-            newt = oldt;
-            newt.c_lflag &= ~(ECHO);
-            tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-        }
-        if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
-            existing_pass[strcspn(existing_pass, "\n")] = '\0';
-        }
-        if (is_tty) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-            printf("\n");
-        }
+        get_masked_password(existing_pass, sizeof(existing_pass));
         
         int res = enroll_luks_keyfile_with_passphrase(dev, existing_pass, BACKUP_KEY_FILE);
         memset(existing_pass, 0, sizeof(existing_pass));
@@ -326,7 +370,15 @@ int process_luks_enrollment(const char *dev, const char *alt_pass, const char *m
         return -1;
     }
     
-    printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", dev);
+    char label[128] = {0};
+    get_device_label(dev, label, sizeof(label));
+
+    if (strlen(label) > 0) {
+        printf("Enrolling alternative and main passwords to LUKS partition '%s' [Label: %s]...\n", dev, label);
+    } else {
+        printf("Enrolling alternative and main passwords to LUKS partition '%s'...\n", dev);
+    }
+
     const char *auth_key = BACKUP_KEY_FILE;
     if (access(BACKUP_KEY_FILE, F_OK) != 0) {
         auth_key = KEY_FILE;
@@ -341,7 +393,11 @@ int process_luks_enrollment(const char *dev, const char *alt_pass, const char *m
 
     if (alt_res != 0 || main_res != 0) {
         if (is_luks_reencrypting(dev)) {
-            printf("LUKS device '%s' is currently busy/locked (encryption in progress).\n", dev);
+            if (strlen(label) > 0) {
+                printf("LUKS device '%s' [Label: %s] is currently busy/locked (encryption in progress).\n", dev, label);
+            } else {
+                printf("LUKS device '%s' is currently busy/locked (encryption in progress).\n", dev);
+            }
             printf("Saving passwords to secure in-memory cache at '%s'...\n", TEMP_KEYS_PATH);
             FILE *tf = fopen(TEMP_KEYS_PATH, "w");
             if (tf) {
@@ -354,32 +410,25 @@ int process_luks_enrollment(const char *dev, const char *alt_pass, const char *m
             }
             return 0;
         } else {
-            printf("\033[93m⚠\033[0m Keyfile authorization failed for '%s'. Fallback to manual LUKS passphrase.\n", dev);
+            if (strlen(label) > 0) {
+                printf("\033[93m⚠\033[0m Keyfile authorization failed for '%s' [Label: %s]. Fallback to manual LUKS passphrase.\n", dev, label);
+            } else {
+                printf("\033[93m⚠\033[0m Keyfile authorization failed for '%s'. Fallback to manual LUKS passphrase.\n", dev);
+            }
             char existing_pass[128] = {0};
             printf("Enter existing LUKS passphrase for '%s': ", dev);
             fflush(stdout);
-            
-            struct termios oldt, newt;
-            int is_tty = isatty(STDIN_FILENO);
-            if (is_tty) {
-                tcgetattr(STDIN_FILENO, &oldt);
-                newt = oldt;
-                newt.c_lflag &= ~(ECHO);
-                tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-            }
-            if (fgets(existing_pass, sizeof(existing_pass), stdin)) {
-                existing_pass[strcspn(existing_pass, "\n")] = '\0';
-            }
-            if (is_tty) {
-                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-                printf("\n");
-            }
+            get_masked_password(existing_pass, sizeof(existing_pass));
             
             alt_res = enroll_luks_key_with_passphrase(dev, existing_pass, alt_pass);
             main_res = enroll_luks_key_with_passphrase(dev, existing_pass, main_pass);
             
             if (alt_res == 0 && main_res == 0) {
-                printf("Successfully enrolled alternative and main passwords into '%s' using passphrase.\n", dev);
+                if (strlen(label) > 0) {
+                    printf("Successfully enrolled alternative and main passwords into '%s' [Label: %s] using passphrase.\n", dev, label);
+                } else {
+                    printf("Successfully enrolled alternative and main passwords into '%s' using passphrase.\n", dev);
+                }
                 
                 printf("Re-creating auto-unlock keyfiles...\n");
                 system("mkdir -p /etc/cryptsetup-keys.d");
@@ -404,7 +453,11 @@ int process_luks_enrollment(const char *dev, const char *alt_pass, const char *m
             memset(existing_pass, 0, sizeof(existing_pass));
         }
     } else {
-        printf("Successfully enrolled alternative and main passwords into '%s' LUKS slots.\n", dev);
+        if (strlen(label) > 0) {
+            printf("Successfully enrolled alternative and main passwords into '%s' [Label: %s] LUKS slots.\n", dev, label);
+        } else {
+            printf("Successfully enrolled alternative and main passwords into '%s' LUKS slots.\n", dev);
+        }
     }
     return 0;
 }
@@ -608,6 +661,9 @@ int generate_offline_root_encryption_script(const char *username, const char *ro
     chmod(script_path, 0755);
     chown(script_path, pw->pw_uid, pw->pw_gid);
     
+    // Enable systemd auto-check service for next boot
+    system("systemctl enable check-root-encryption.service 2>/dev/null || true");
+    
     printf("\n📝 Created ready-to-run offline root encryption script at: '%s'\n", script_path);
     return 0;
 }
@@ -734,27 +790,11 @@ int main(int argc, char **argv) {
 
     printf("Enter alternative password for '%s': ", username);
     fflush(stdout);
-    if (!fgets(alt_pass, sizeof(alt_pass), stdin)) return 1;
-    alt_pass[strcspn(alt_pass, "\n")] = '\0';
+    get_masked_password(alt_pass, sizeof(alt_pass));
 
     printf("Enter main (keyring/unix) password for '%s': ", username);
     fflush(stdout);
-    struct stat st;
-    int is_tty = isatty(STDIN_FILENO);
-    #include <termios.h>
-    struct termios oldt, newt;
-    if (is_tty) {
-        tcgetattr(STDIN_FILENO, &oldt);
-        newt = oldt;
-        newt.c_lflag &= ~(ECHO);
-        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    }
-    if (!fgets(main_pass, sizeof(main_pass), stdin)) return 1;
-    if (is_tty) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-        printf("\n");
-    }
-    main_pass[strcspn(main_pass, "\n")] = '\0';
+    get_masked_password(main_pass, sizeof(main_pass));
 
     struct vault_record new_rec;
     memset(&new_rec, 0, sizeof(new_rec));
@@ -884,9 +924,16 @@ int main(int argc, char **argv) {
             continue;
         }
         
+        char label[128] = {0};
+        get_device_label(dev_name, label, sizeof(label));
+
         if (strcmp(dev_name, root_dev) == 0) {
             if (!is_luks_device(root_dev)) {
-                printf("\n💾 Found unencrypted root partition: '%s' (filesystem: %s)\n", dev_name, fstype);
+                if (strlen(label) > 0) {
+                    printf("\n💾 Found unencrypted root partition: '%s' [Label: %s] (filesystem: %s)\n", dev_name, label, fstype);
+                } else {
+                    printf("\n💾 Found unencrypted root partition: '%s' (filesystem: %s)\n", dev_name, fstype);
+                }
                 printf("Note: Active root partition encryption must be run offline (e.g. from a Live USB).\n");
                 printf("Would you like to prepare a custom offline root encryption script in your home directory? (y/N): ");
                 fflush(stdout);
@@ -906,7 +953,11 @@ int main(int argc, char **argv) {
         if (is_luks_device(dev_name)) {
             process_luks_enrollment(dev_name, alt_pass, main_pass);
         } else {
-            printf("\n💾 Found unencrypted partition: '%s' (filesystem: %s)\n", dev_name, fstype);
+            if (strlen(label) > 0) {
+                printf("\n💾 Found unencrypted partition: '%s' [Label: %s] (filesystem: %s)\n", dev_name, label, fstype);
+            } else {
+                printf("\n💾 Found unencrypted partition: '%s' (filesystem: %s)\n", dev_name, fstype);
+            }
             printf("Would you like to initialize and start in-place LUKS encryption on '%s'? (y/N): ", dev_name);
             fflush(stdout);
             char ans[10] = {0};

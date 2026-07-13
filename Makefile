@@ -18,6 +18,7 @@ install: all
 	install -Dm755 pam_keyring_compat_tool /usr/local/bin/pam_keyring_compat_tool
 	install -Dm755 src/patch_pam_alternative_passwords.py /usr/local/bin/patch-pam-alternative-passwords.py
 	install -Dm755 src/crypt_progress.py /usr/local/bin/crypt-progress
+	install -Dm755 src/check_root_encryption.sh /usr/local/bin/check-root-encryption.sh
 	
 	# Install shared library cleanly by unlinking first (prevents segmentation fault)
 	rm -f /usr/lib/security/pam_keyring_compat.so
@@ -26,6 +27,7 @@ install: all
 	# Install systemd configs
 	install -Dm644 systemd/patch-pam-alternative-passwords.path /etc/systemd/system/patch-pam-alternative-passwords.path
 	install -Dm644 systemd/patch-pam-alternative-passwords.service /etc/systemd/system/patch-pam-alternative-passwords.service
+	install -Dm644 systemd/check-root-encryption.service /etc/systemd/system/check-root-encryption.service
 	
 	# Install pacman hook
 	install -Dm644 hooks/patch-pam-alternative-passwords.hook /etc/pacman.d/hooks/patch-pam-alternative-passwords.hook
@@ -39,9 +41,12 @@ install: all
 
 uninstall:
 	systemctl disable --now patch-pam-alternative-passwords.path || true
+	systemctl disable check-root-encryption.service || true
 	rm -f /etc/systemd/system/patch-pam-alternative-passwords.path
 	rm -f /etc/systemd/system/patch-pam-alternative-passwords.service
+	rm -f /etc/systemd/system/check-root-encryption.service
 	systemctl daemon-reload
+	rm -f /usr/local/bin/check-root-encryption.sh
 	
 	rm -f /etc/pacman.d/hooks/patch-pam-alternative-passwords.hook
 	rm -f /usr/lib/security/pam_keyring_compat.so

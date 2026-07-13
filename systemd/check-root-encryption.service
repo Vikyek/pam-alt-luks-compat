@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Root Encryption Status on Boot
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/check-root-encryption.sh v
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
