@@ -1,90 +1,95 @@
 # PAM Alternative Password & LUKS Compatibility Toolset
 
-This project provides a robust, permanent solution for integrating alternative password authentication on Arch Linux, ensuring complete compatibility with `su`/`sudo`, screen locking, and automated GNOME Keyring decryption. Additionally, it automates in-place LUKS encryption for secondary partitions with a themed, formatted terminal progress bar.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+This project provides a robust, permanent solution for integrating alternative password authentication on Arch Linux, ensuring complete compatibility with `su`/`sudo`, screen locking, and automated GNOME Keyring decryption. Additionally, it automates progress monitoring and verification for root partition LUKS encryption.
 
 ---
 
-## Features
+## 📋 Requirements & Dependencies
 
-1.  **Keyring Compatibility (`pam_keyring_compat.so`):**
-    Allows GNOME Keyring to unlock automatically when logging in with an alternative password. Stores the main password encrypted via AES-256-GCM in `/etc/pam_keyring_compat.vault` (keys derived using PBKDF2), decrypting it at login to populate the PAM authentication token.
-2.  **Persistent Systemd Watcher:**
-    Monitors core PAM files (`system-auth`, `su`, `su-l`, `vlock`, and quickshell `passwd`) for modifications or package overrides (such as `pambase` updates or manual `.pacnew` merges). Re-applies configuration patches automatically.
-3.  **Dynamic Partition & Passphrase Tool (`pam_keyring_compat_tool`):**
-    Enrolls your passwords into the Keyring Vault, dynamically scans all system partitions, and automatically enrolls them into LUKS slots.
-    *   **Masked Password Entry:** Hides all typed passphrases (alt pass, main pass, LUKS pass) using standard `*` characters.
-    *   **Partition Label Mentions:** Reads and mentions partition `PARTLABEL` or `LABEL` in prompt outputs.
-    *   **Self-Healing Keyfile Restoration:** If auto-unlock keyfiles (`data.key`/`data.key.backup`) are missing/deleted, it automatically regenerates them and prompts for your existing LUKS passphrase to authorize enrollment.
-    *   **Passphrase Fallback:** Falls back to direct passphrase authorization if keyfiles fail validation.
-    *   **Offline Root Encryption Script & Auto-Check:** If an unencrypted root partition is found, it offers to generate a custom, ready-to-run chrooted script (`~/encrypt-root-offline.sh`) to perform offline in-place Btrfs/Ext4 root partition encryption from a Live USB. It also enables a temporary systemd service (`check-root-encryption.service`) that automatically monitors the next boot: if root encryption succeeded, it deletes the offline script, triggers a critical desktop notification reporting success, and disables itself.
-4.  **CLI Progress Monitor (`crypt-progress`):**
-    A themed, rounded-corner terminal progress card monitor designed to mirror the color layouts and ASCII logo of your desktop's Caelestia fetch configuration. Includes an interactive arrow-key theme selector (`-t`/`--theme-menu`).
+- **Operating System:** Arch Linux or Arch-based distributions
+- **Build Tools & Libraries:**
+  - `gcc` / `clang` (C compiler)
+  - `make`
+  - `pam` (Linux-PAM development headers)
+  - `openssl` (libcrypto)
+  - `python3`
+- **System Utilities:**
+  - `systemd`
+  - `cryptsetup`
+  - `pacman`
 
----
-
-## Directory Structure
-
-```text
-pam-alt-luks-compat/
-├── hooks/
-│   └── patch-pam-alternative-passwords.hook       # Pacman hook
-├── src/
-│   ├── crypt_progress.py                          # Themed CLI monitor
-│   ├── pam_keyring_compat.c                       # PAM module & tool C source
-│   └── patch_pam_alternative_passwords.py         # PAM configuration patch script
-├── systemd/
-│   ├── patch-pam-alternative-passwords.path       # Watcher path unit
-│   └── patch-pam-alternative-passwords.service    # Watcher service unit
-├── Makefile                                       # Automation script
-├── README.md                                      # Documentation
-└── .gitignore                                     # Git ignore patterns
+Install build dependencies on Arch Linux:
+```bash
+sudo pacman -S base-devel pam openssl python cryptsetup
 ```
 
 ---
 
-## Installation
+## 🌟 Key Features
 
-To compile the binaries, install scripts and modules, register systemd watchers, and apply the PAM patches in one command, run:
+1. **PAM Alternative Password Integration (`pam_keyring_compat`):**
+   - Seamlessly unlocks GNOME Keyring and handles alternative authentication hashes across `system-auth`, `su`, `su-l`, and `vlock`.
+   - Protects against pam stack breakage across system updates.
 
+2. **Automated Pacman & Systemd Watcher:**
+   - Systemd path watcher (`patch-pam-alternative-passwords.path`) monitors `/etc/pam.d/` changes.
+   - Pacman post-transaction hook automatically reapplies compatibility patches after PAM package upgrades.
+
+3. **LUKS Encryption Verification & Progress:**
+   - Background encryption health checker (`check-root-encryption.service`).
+   - Terminal encryption progress visualization utility (`crypt-progress`).
+
+---
+
+## 🚀 Installation & Setup
+
+### Automated Installation
 ```bash
+git clone https://github.com/Vikyek/pam-alt-luks-compat.git
+cd pam-alt-luks-compat
+chmod +x install.sh
+./install.sh
+```
+
+### Manual Installation (Makefile)
+```bash
+cd pam-alt-luks-compat
+make
 sudo make install
 ```
 
-To clean up all system configurations, disable the systemd services, and cleanly restore original PAM files from backup, run:
+---
 
+## 💻 Usage & Verification
+
+### Verify PAM Configuration
+Check that alternative password patches and keyring compat modules are active:
+```bash
+sudo /usr/local/bin/patch-pam-alternative-passwords.py
+```
+
+### Check LUKS Encryption Progress
+Run the progress monitor to observe active disk encryption re-encryption sessions:
+```bash
+crypt-progress
+```
+
+### Check Systemd Watcher Status
+```bash
+systemctl status patch-pam-alternative-passwords.path
+```
+
+---
+
+## 🗑️ Uninstallation
+To completely remove the modules and restore original PAM configurations:
 ```bash
 sudo make uninstall
 ```
 
-To clear local build artifacts:
-
-```bash
-make clean
-```
-
 ---
 
-## Post-Install Usage
-
-### 1. Unified Password Registration (Keyring + LUKS)
-To configure the secure keyring compatibility vault and enroll your passwords for all candidate partitions, run:
-
-```bash
-sudo pam_keyring_compat_tool --set v
-```
-*   *Note on Dynamic Partition Scanning:* The tool automatically detects all partitions on the system, excluding boot/EFI and the active root partition. It will enroll keys into any LUKS-encrypted partitions, and offer online in-place encryption for other unencrypted partitions.
-*   *Note on Offline Root Encryption:* Since an active root partition cannot be encrypted online, if the root partition is unencrypted, the tool will offer to generate a custom, automated offline root encryption script (`~/encrypt-root-offline.sh`). You can run this script after booting from a Live USB to securely perform in-place encryption on your root partition.
-
-### 2. Monitoring Encryption progress
-You can watch the in-place encryption using the themed visual monitor card:
-
-```bash
-sudo crypt-progress
-```
-
-To select a theme (like **Caelestia**, **Midnight Cyber**, **Minimalist**, **Forest**, or **Oceanic**):
-
-```bash
-sudo crypt-progress --theme-menu
-```
-*   *Note:* Themes are saved locally in the user config folder at `~/.config/crypt-progress/config.json`.
+## 📄 License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
